@@ -6,11 +6,7 @@ Make sure Python 3.10 or newer is installed.
 You can check with:
 python --version
 
-2. Clone the Repository
-
-git clone https://github.com/YOUR_USERNAME/resume-ats-ai.git
-cd resume-ats-ai
-
+2. Clone the repo if u wanna otherwise idc either
 
 3. Install Ollama
 Download and install Ollama from:
