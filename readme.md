@@ -6,20 +6,23 @@ Make sure Python 3.10 or newer is installed.
 You can check with:
 python --version
 
+2. Clone the Repository
 
-2. Install Ollama
+git clone https://github.com/YOUR_USERNAME/resume-ats-ai.git
+cd resume-ats-ai
+
+
+3. Install Ollama
 Download and install Ollama from:
 https://ollama.com
+
+or 
+curl -fsSL https://ollama.com/install.sh | sh
+
 
 After installing, pull the required model:
 
 ollama pull qwen2.5:7b-instruct
-
-
-3. Clone the Repository
-
-git clone https://github.com/YOUR_USERNAME/resume-ats-ai.git
-cd resume-ats-ai
 
 
 4. Create a Virtual Environment
@@ -27,7 +30,7 @@ cd resume-ats-ai
 python -m venv .venv
 
 
-5. Activate the Virtual Environment
+6. Activate the Virtual Environment
 
 Linux / Mac:
 source .venv/bin/activate
@@ -36,17 +39,17 @@ Windows:
 .venv\Scripts\activate
 
 
-6. Install Required Dependencies
+7. Install Required Dependencies
 
 pip install -r requirements.txt
 
 
-7. Run the Server
+8. Run the Server
 
 uvicorn main:app --reload
 
 
-8. Open the API
+9. Open the API
 
 Server will run at:
 http://127.0.0.1:8000
@@ -55,7 +58,7 @@ Interactive API documentation:
 http://127.0.0.1:8000/docs
 
 
-9. Available Endpoints
+10. Available Endpoints
 
 Upload a resume and convert it to the generator schema:
 POST /parse_resume
