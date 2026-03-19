@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
@@ -15,8 +17,8 @@ import docx
 
 app = FastAPI(title="ResumeBuilderAI - Qwen Edition")
 
-OLLAMA_API = "http://127.0.0.1:11434/api/generate"
-MODEL = "qwen2.5:7b-instruct"
+OLLAMA_API = os.getenv("OLLAMA_API", "http://127.0.0.1:11434/api/generate")
+MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
 
 
 # ==============================
