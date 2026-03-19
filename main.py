@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
@@ -19,6 +21,91 @@ app = FastAPI(title="ResumeBuilderAI - Qwen Edition")
 
 OLLAMA_API = os.getenv("OLLAMA_API", "http://127.0.0.1:11434/api/generate")
 MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+OLLAMA_PULL_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_PULL_TIMEOUT_SECONDS", "1800"))
+
+_MODEL_READY = False
+_MODEL_LOCK = threading.Lock()
+
+
+def _ollama_base_url() -> str:
+    # Example: http://ollama:11434/api/generate -> http://ollama:11434
+    return OLLAMA_API.split("/api/generate", 1)[0].rstrip("/")
+
+
+def _is_model_present() -> bool:
+    try:
+        tags_url = f"{_ollama_base_url()}/api/tags"
+        resp = requests.get(tags_url, timeout=10)
+        resp.raise_for_status()
+        payload = resp.json() if resp.content else {}
+        models = payload.get("models") or []
+        names = {(m.get("name") or "").strip() for m in models if isinstance(m, dict)}
+        return MODEL in names
+    except Exception:
+        return False
+
+
+def _pull_model_if_missing() -> bool:
+    pull_url = f"{_ollama_base_url()}/api/pull"
+    print(
+        f"[AI] Ensuring Ollama model '{MODEL}' is available via POST {pull_url} "
+        f"(timeout={OLLAMA_PULL_TIMEOUT_SECONDS}s)..."
+    )
+    pull_resp = requests.post(
+        pull_url,
+        json={"name": MODEL},
+        stream=True,
+        timeout=OLLAMA_PULL_TIMEOUT_SECONDS,
+    )
+    pull_resp.raise_for_status()
+
+    success = False
+    last_status = None
+    for line in pull_resp.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        status = obj.get("status")
+        if isinstance(status, str) and status != last_status:
+            print(f"[AI] ollama pull status: {status}")
+            last_status = status
+        if isinstance(status, str) and status.lower().startswith("success"):
+            success = True
+    return success
+
+
+def ensure_model_available(force_pull: bool = False) -> None:
+    global _MODEL_READY
+    if _MODEL_READY and not force_pull:
+        return
+
+    with _MODEL_LOCK:
+        if _MODEL_READY and not force_pull:
+            return
+
+        if not force_pull and _is_model_present():
+            _MODEL_READY = True
+            return
+
+        retries = 2
+        for attempt in range(1, retries + 1):
+            try:
+                pulled = _pull_model_if_missing()
+                if pulled or _is_model_present():
+                    _MODEL_READY = True
+                    print(f"[AI] Ollama model '{MODEL}' is ready.")
+                    return
+            except Exception as e:
+                print(f"[AI] Model pull attempt {attempt}/{retries} failed: {e}")
+                if attempt < retries:
+                    time.sleep(2)
+                    continue
+                raise
+
+        raise RuntimeError(f"Ollama model '{MODEL}' not available after retries")
 
 
 # ==============================
@@ -94,10 +181,30 @@ def call_ollama(prompt: str):
         }
     }
 
-    response = requests.post(OLLAMA_API, json=payload, timeout=180)
-    response.raise_for_status()
+    # Fast path: ensure model once, then call generate.
+    ensure_model_available()
+    try:
+        response = requests.post(OLLAMA_API, json=payload, timeout=180)
+        response.raise_for_status()
+        return response.json().get("response", "")
+    except requests.HTTPError as e:
+        # If model was unloaded/missing, force pull and retry once.
+        if getattr(e.response, "status_code", None) == 404:
+            ensure_model_available(force_pull=True)
+            retry = requests.post(OLLAMA_API, json=payload, timeout=180)
+            retry.raise_for_status()
+            return retry.json().get("response", "")
+        raise
 
-    return response.json().get("response", "")
+
+@app.on_event("startup")
+def _warm_ollama_model() -> None:
+    # Pre-warm on startup to avoid first-request 404 and long UI waits.
+    try:
+        ensure_model_available()
+    except Exception as e:
+        # Keep service booting; request path still retries.
+        print(f"[AI] Startup model warm-up warning: {e}")
 
 
 def safe_json_parse(text: str):
