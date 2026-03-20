@@ -3,7 +3,7 @@ import threading
 import time
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Optional, Dict
 import requests
 import json
@@ -22,7 +22,8 @@ app = FastAPI(title="ResumeBuilderAI - Qwen Edition")
 OLLAMA_API = os.getenv("OLLAMA_API", "http://127.0.0.1:11434/api/generate")
 MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
 OLLAMA_PULL_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_PULL_TIMEOUT_SECONDS", "1800"))
-OLLAMA_GENERATE_TIMEOUT = int(os.getenv("OLLAMA_GENERATE_TIMEOUT", "600"))
+# Single /api/generate call can exceed 3 minutes on CPU (Qwen 7B + large JSON prompts).
+OLLAMA_GENERATE_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_GENERATE_TIMEOUT_SECONDS", "600"))
 
 _MODEL_READY = False
 _MODEL_LOCK = threading.Lock()
@@ -113,32 +114,111 @@ def ensure_model_available(force_pull: bool = False) -> None:
 # DATA MODELS
 # ==============================
 
+def _str_or_empty(v) -> str:
+    """LLM JSON often uses null for missing dates/strings; coerce for Pydantic."""
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+def _optional_str(v) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
+def _str_list(v) -> List[str]:
+    if v is None:
+        return []
+    if not isinstance(v, list):
+        return []
+    out: List[str] = []
+    for x in v:
+        if x is None:
+            continue
+        s = str(x).strip()
+        if s:
+            out.append(s)
+    return out
+
+
 class Experience(BaseModel):
-    role: str
-    company: str
+    role: str = ""
+    company: str = ""
     location: Optional[str] = None
-    startDate: str
-    endDate: str
+    startDate: str = ""
+    endDate: str = ""
     bullets: List[str] = Field(default_factory=list)
+
+    @field_validator("role", "company", "startDate", "endDate", mode="before")
+    @classmethod
+    def _coerce_required_strings(cls, v):
+        return _str_or_empty(v)
+
+    @field_validator("location", mode="before")
+    @classmethod
+    def _coerce_location(cls, v):
+        return _optional_str(v)
+
+    @field_validator("bullets", mode="before")
+    @classmethod
+    def _coerce_bullets(cls, v):
+        return _str_list(v)
 
 
 class Project(BaseModel):
-    title: str
+    title: str = ""
     link: Optional[str] = None
     bullets: List[str] = Field(default_factory=list)
 
+    @field_validator("title", mode="before")
+    @classmethod
+    def _coerce_title(cls, v):
+        return _str_or_empty(v)
+
+    @field_validator("link", mode="before")
+    @classmethod
+    def _coerce_link(cls, v):
+        return _optional_str(v)
+
+    @field_validator("bullets", mode="before")
+    @classmethod
+    def _coerce_bullets(cls, v):
+        return _str_list(v)
+
 
 class Education(BaseModel):
-    school: str
-    degree: str
-    field: str
+    school: str = ""
+    degree: str = ""
+    field: str = ""
     location: Optional[str] = None
-    endDate: str
+    endDate: str = ""
+
+    @field_validator("school", "degree", "field", "endDate", mode="before")
+    @classmethod
+    def _coerce_edu_strings(cls, v):
+        return _str_or_empty(v)
+
+    @field_validator("location", mode="before")
+    @classmethod
+    def _coerce_edu_location(cls, v):
+        return _optional_str(v)
 
 
 class SkillCategory(BaseModel):
-    category: str
-    skills: List[str]
+    category: str = "Technical"
+    skills: List[str] = Field(default_factory=list)
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def _coerce_cat(cls, v):
+        return _str_or_empty(v) or "Technical"
+
+    @field_validator("skills", mode="before")
+    @classmethod
+    def _coerce_skills(cls, v):
+        return _str_list(v)
 
 
 class ResumeRequest(BaseModel):
@@ -156,12 +236,41 @@ class ResumeRequest(BaseModel):
 
 
 class OptimizedResume(BaseModel):
-    summary: str
-    experiences: List[Experience]
-    projects: List[Project]
-    education: List[Education]
-    skills: List[SkillCategory]
-    ats_report: Dict[str, object]
+    summary: str = ""
+    experiences: List[Experience] = Field(default_factory=list)
+    projects: List[Project] = Field(default_factory=list)
+    education: List[Education] = Field(default_factory=list)
+    skills: List[SkillCategory] = Field(default_factory=list)
+    ats_report: Dict[str, object] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _scrub_llm_payload(cls, data):
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        for key in ("experiences", "projects", "education", "skills"):
+            raw = out.get(key)
+            if isinstance(raw, list):
+                out[key] = [x for x in raw if x is not None and isinstance(x, dict)]
+            else:
+                out[key] = []
+        return out
+
+    @field_validator("summary", mode="before")
+    @classmethod
+    def _coerce_summary(cls, v):
+        return _str_or_empty(v)
+
+    @field_validator("experiences", "projects", "education", "skills", mode="before")
+    @classmethod
+    def _coerce_lists(cls, v):
+        return v if isinstance(v, list) else []
+
+    @field_validator("ats_report", mode="before")
+    @classmethod
+    def _coerce_ats(cls, v):
+        return v if isinstance(v, dict) else {}
 
 
 # ==============================
@@ -184,15 +293,21 @@ def call_ollama(prompt: str):
 
     # Fast path: ensure model once, then call generate.
     ensure_model_available()
+    gen_timeout = OLLAMA_GENERATE_TIMEOUT_SECONDS
     try:
-        response = requests.post(OLLAMA_API, json=payload, timeout=OLLAMA_GENERATE_TIMEOUT)
+        response = requests.post(OLLAMA_API, json=payload, timeout=gen_timeout)
         response.raise_for_status()
         return response.json().get("response", "")
+    except requests.Timeout as e:
+        raise RuntimeError(
+            f"Ollama /api/generate timed out after {gen_timeout}s. "
+            "On CPU, increase OLLAMA_GENERATE_TIMEOUT_SECONDS (e.g. 900–1200)."
+        ) from e
     except requests.HTTPError as e:
         # If model was unloaded/missing, force pull and retry once.
         if getattr(e.response, "status_code", None) == 404:
             ensure_model_available(force_pull=True)
-            retry = requests.post(OLLAMA_API, json=payload, timeout=OLLAMA_GENERATE_TIMEOUT)
+            retry = requests.post(OLLAMA_API, json=payload, timeout=gen_timeout)
             retry.raise_for_status()
             return retry.json().get("response", "")
         raise
