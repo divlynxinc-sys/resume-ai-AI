@@ -22,6 +22,7 @@ app = FastAPI(title="ResumeBuilderAI - Qwen Edition")
 OLLAMA_API = os.getenv("OLLAMA_API", "http://127.0.0.1:11434/api/generate")
 MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
 OLLAMA_PULL_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_PULL_TIMEOUT_SECONDS", "1800"))
+OLLAMA_GENERATE_TIMEOUT = int(os.getenv("OLLAMA_GENERATE_TIMEOUT", "600"))
 
 _MODEL_READY = False
 _MODEL_LOCK = threading.Lock()
@@ -184,14 +185,14 @@ def call_ollama(prompt: str):
     # Fast path: ensure model once, then call generate.
     ensure_model_available()
     try:
-        response = requests.post(OLLAMA_API, json=payload, timeout=180)
+        response = requests.post(OLLAMA_API, json=payload, timeout=OLLAMA_GENERATE_TIMEOUT)
         response.raise_for_status()
         return response.json().get("response", "")
     except requests.HTTPError as e:
         # If model was unloaded/missing, force pull and retry once.
         if getattr(e.response, "status_code", None) == 404:
             ensure_model_available(force_pull=True)
-            retry = requests.post(OLLAMA_API, json=payload, timeout=180)
+            retry = requests.post(OLLAMA_API, json=payload, timeout=OLLAMA_GENERATE_TIMEOUT)
             retry.raise_for_status()
             return retry.json().get("response", "")
         raise
