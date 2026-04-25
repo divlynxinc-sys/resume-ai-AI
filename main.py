@@ -607,12 +607,21 @@ CANDIDATE RESUME:
 
 def compute_coverage(resume: OptimizedResume, jd_data: dict):
 
-    must_have = [k.lower() for k in jd_data.get("must_have_keywords", [])]
+    must_have = [k.lower() for k in jd_data.get("must_have_keywords", []) if k and str(k).strip()]
 
-    resume_text = json.dumps(resume.model_dump()).lower()
+    # Score against the resume body only — exclude ats_report so the LLM's own
+    # keywords_covered/keywords_missing arrays don't trivially satisfy the check.
+    body = resume.model_dump(exclude={"ats_report"})
+    resume_text = json.dumps(body).lower()
 
-    covered = [k for k in must_have if k in resume_text]
-    missing = [k for k in must_have if k not in resume_text]
+    def _matches(keyword: str) -> bool:
+        # Word-boundary match so "go" doesn't match "google", "sql" doesn't
+        # match "mysql"/"postgresql"/"nosql", etc.
+        pattern = r"(?<![A-Za-z0-9+#.])" + re.escape(keyword) + r"(?![A-Za-z0-9+#])"
+        return re.search(pattern, resume_text) is not None
+
+    covered = [k for k in must_have if _matches(k)]
+    missing = [k for k in must_have if not _matches(k)]
 
     coverage_percent = round(
         (len(covered) / max(len(must_have), 1)) * 100,
