@@ -678,6 +678,30 @@ def compute_ats_score(resume: OptimizedResume, jd_data: dict):
     }
 
 
+def compute_initial_ats_score(req: "ResumeRequest", jd_data: dict):
+    """
+    Score the user's RAW input resume against the JD before any LLM rewriting.
+    Uses the same regex as compute_coverage so the two numbers are directly comparable.
+    """
+    must_have = [k.lower() for k in jd_data.get("must_have_keywords", []) if k and str(k).strip()]
+    body = req.model_dump(exclude={"job_description"})
+    resume_text = json.dumps(body).lower()
+
+    def _matches(keyword: str) -> bool:
+        pattern = r"(?<![A-Za-z0-9+#.])" + re.escape(keyword) + r"(?![A-Za-z0-9+#])"
+        return re.search(pattern, resume_text) is not None
+
+    covered = [k for k in must_have if _matches(k)]
+    missing = [k for k in must_have if not _matches(k)]
+    coverage = round((len(covered) / max(len(must_have), 1)) * 100, 2)
+
+    return {
+        "final_ats_score": coverage,
+        "keywords_found": covered,
+        "keywords_missing": missing,
+    }
+
+
 # ==============================
 # IMPROVEMENT LOOP
 # ==============================
@@ -760,6 +784,10 @@ def generate_resume(req: ResumeRequest):
 
         jd_data = extract_jd_signals(req.job_description)
 
+        # Score the user's raw resume BEFORE any optimization, so the response
+        # includes both a real "before" baseline and the post-optimization "after".
+        initial_ats = compute_initial_ats_score(req, jd_data)
+
         optimized_resume = optimize_resume(req, jd_data)
 
         optimized_resume = improve_resume_if_needed(
@@ -785,6 +813,12 @@ def generate_resume(req: ResumeRequest):
             "resume": optimized_resume.model_dump(),
 
             "jd_analysis": jd_data,
+
+            "ats_initial_result": {
+                "final_ats_score": initial_ats["final_ats_score"],
+                "keywords_found": initial_ats["keywords_found"],
+                "keywords_missing": initial_ats["keywords_missing"]
+            },
 
             "ats_final_result": {
                 "final_ats_score": ats_score["final_ats_score"],
