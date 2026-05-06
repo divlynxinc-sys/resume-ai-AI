@@ -1,9 +1,5 @@
-import os
-import threading
-import time
-
 from fastapi import FastAPI, HTTPException, UploadFile, File
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 import requests
 import json
@@ -19,206 +15,40 @@ import docx
 
 app = FastAPI(title="ResumeBuilderAI - Qwen Edition")
 
-OLLAMA_API = os.getenv("OLLAMA_API", "http://127.0.0.1:11434/api/generate")
-MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
-OLLAMA_PULL_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_PULL_TIMEOUT_SECONDS", "1800"))
-# Single /api/generate call can exceed 3 minutes on CPU (Qwen 7B + large JSON prompts).
-OLLAMA_GENERATE_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_GENERATE_TIMEOUT_SECONDS", "600"))
-
-_MODEL_READY = False
-_MODEL_LOCK = threading.Lock()
-
-
-def _ollama_base_url() -> str:
-    # Example: http://ollama:11434/api/generate -> http://ollama:11434
-    return OLLAMA_API.split("/api/generate", 1)[0].rstrip("/")
-
-
-def _is_model_present() -> bool:
-    try:
-        tags_url = f"{_ollama_base_url()}/api/tags"
-        resp = requests.get(tags_url, timeout=10)
-        resp.raise_for_status()
-        payload = resp.json() if resp.content else {}
-        models = payload.get("models") or []
-        names = {(m.get("name") or "").strip() for m in models if isinstance(m, dict)}
-        return MODEL in names
-    except Exception:
-        return False
-
-
-def _pull_model_if_missing() -> bool:
-    pull_url = f"{_ollama_base_url()}/api/pull"
-    print(
-        f"[AI] Ensuring Ollama model '{MODEL}' is available via POST {pull_url} "
-        f"(timeout={OLLAMA_PULL_TIMEOUT_SECONDS}s)..."
-    )
-    pull_resp = requests.post(
-        pull_url,
-        json={"name": MODEL},
-        stream=True,
-        timeout=OLLAMA_PULL_TIMEOUT_SECONDS,
-    )
-    pull_resp.raise_for_status()
-
-    success = False
-    last_status = None
-    for line in pull_resp.iter_lines(decode_unicode=True):
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
-        status = obj.get("status")
-        if isinstance(status, str) and status != last_status:
-            print(f"[AI] ollama pull status: {status}")
-            last_status = status
-        if isinstance(status, str) and status.lower().startswith("success"):
-            success = True
-    return success
-
-
-def ensure_model_available(force_pull: bool = False) -> None:
-    global _MODEL_READY
-    if _MODEL_READY and not force_pull:
-        return
-
-    with _MODEL_LOCK:
-        if _MODEL_READY and not force_pull:
-            return
-
-        if not force_pull and _is_model_present():
-            _MODEL_READY = True
-            return
-
-        retries = 2
-        for attempt in range(1, retries + 1):
-            try:
-                pulled = _pull_model_if_missing()
-                if pulled or _is_model_present():
-                    _MODEL_READY = True
-                    print(f"[AI] Ollama model '{MODEL}' is ready.")
-                    return
-            except Exception as e:
-                print(f"[AI] Model pull attempt {attempt}/{retries} failed: {e}")
-                if attempt < retries:
-                    time.sleep(2)
-                    continue
-                raise
-
-        raise RuntimeError(f"Ollama model '{MODEL}' not available after retries")
+OLLAMA_API = "http://127.0.0.1:11434/api/generate"
+MODEL = "qwen2.5:7b-instruct"
 
 
 # ==============================
 # DATA MODELS
 # ==============================
 
-def _str_or_empty(v) -> str:
-    """LLM JSON often uses null for missing dates/strings; coerce for Pydantic."""
-    if v is None:
-        return ""
-    return str(v).strip()
-
-
-def _optional_str(v) -> Optional[str]:
-    if v is None:
-        return None
-    s = str(v).strip()
-    return s if s else None
-
-
-def _str_list(v) -> List[str]:
-    if v is None:
-        return []
-    if not isinstance(v, list):
-        return []
-    out: List[str] = []
-    for x in v:
-        if x is None:
-            continue
-        s = str(x).strip()
-        if s:
-            out.append(s)
-    return out
-
-
 class Experience(BaseModel):
-    role: str = ""
-    company: str = ""
+    role: str
+    company: str
     location: Optional[str] = None
-    startDate: str = ""
-    endDate: str = ""
+    startDate: str
+    endDate: str
     bullets: List[str] = Field(default_factory=list)
-
-    @field_validator("role", "company", "startDate", "endDate", mode="before")
-    @classmethod
-    def _coerce_required_strings(cls, v):
-        return _str_or_empty(v)
-
-    @field_validator("location", mode="before")
-    @classmethod
-    def _coerce_location(cls, v):
-        return _optional_str(v)
-
-    @field_validator("bullets", mode="before")
-    @classmethod
-    def _coerce_bullets(cls, v):
-        return _str_list(v)
 
 
 class Project(BaseModel):
-    title: str = ""
+    title: str
     link: Optional[str] = None
     bullets: List[str] = Field(default_factory=list)
 
-    @field_validator("title", mode="before")
-    @classmethod
-    def _coerce_title(cls, v):
-        return _str_or_empty(v)
-
-    @field_validator("link", mode="before")
-    @classmethod
-    def _coerce_link(cls, v):
-        return _optional_str(v)
-
-    @field_validator("bullets", mode="before")
-    @classmethod
-    def _coerce_bullets(cls, v):
-        return _str_list(v)
-
 
 class Education(BaseModel):
-    school: str = ""
-    degree: str = ""
-    field: str = ""
+    school: str
+    degree: str
+    field: str
     location: Optional[str] = None
-    endDate: str = ""
-
-    @field_validator("school", "degree", "field", "endDate", mode="before")
-    @classmethod
-    def _coerce_edu_strings(cls, v):
-        return _str_or_empty(v)
-
-    @field_validator("location", mode="before")
-    @classmethod
-    def _coerce_edu_location(cls, v):
-        return _optional_str(v)
+    endDate: str
 
 
 class SkillCategory(BaseModel):
-    category: str = "Technical"
-    skills: List[str] = Field(default_factory=list)
-
-    @field_validator("category", mode="before")
-    @classmethod
-    def _coerce_cat(cls, v):
-        return _str_or_empty(v) or "Technical"
-
-    @field_validator("skills", mode="before")
-    @classmethod
-    def _coerce_skills(cls, v):
-        return _str_list(v)
+    category: str
+    skills: List[str]
 
 
 class ResumeRequest(BaseModel):
@@ -236,41 +66,12 @@ class ResumeRequest(BaseModel):
 
 
 class OptimizedResume(BaseModel):
-    summary: str = ""
-    experiences: List[Experience] = Field(default_factory=list)
-    projects: List[Project] = Field(default_factory=list)
-    education: List[Education] = Field(default_factory=list)
-    skills: List[SkillCategory] = Field(default_factory=list)
-    ats_report: Dict[str, object] = Field(default_factory=dict)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _scrub_llm_payload(cls, data):
-        if not isinstance(data, dict):
-            return data
-        out = dict(data)
-        for key in ("experiences", "projects", "education", "skills"):
-            raw = out.get(key)
-            if isinstance(raw, list):
-                out[key] = [x for x in raw if x is not None and isinstance(x, dict)]
-            else:
-                out[key] = []
-        return out
-
-    @field_validator("summary", mode="before")
-    @classmethod
-    def _coerce_summary(cls, v):
-        return _str_or_empty(v)
-
-    @field_validator("experiences", "projects", "education", "skills", mode="before")
-    @classmethod
-    def _coerce_lists(cls, v):
-        return v if isinstance(v, list) else []
-
-    @field_validator("ats_report", mode="before")
-    @classmethod
-    def _coerce_ats(cls, v):
-        return v if isinstance(v, dict) else {}
+    summary: str
+    experiences: List[Experience]
+    projects: List[Project]
+    education: List[Education]
+    skills: List[SkillCategory]
+    ats_report: Dict[str, object]
 
 
 # ==============================
@@ -291,36 +92,10 @@ def call_ollama(prompt: str):
         }
     }
 
-    # Fast path: ensure model once, then call generate.
-    ensure_model_available()
-    gen_timeout = OLLAMA_GENERATE_TIMEOUT_SECONDS
-    try:
-        response = requests.post(OLLAMA_API, json=payload, timeout=gen_timeout)
-        response.raise_for_status()
-        return response.json().get("response", "")
-    except requests.Timeout as e:
-        raise RuntimeError(
-            f"Ollama /api/generate timed out after {gen_timeout}s. "
-            "On CPU, increase OLLAMA_GENERATE_TIMEOUT_SECONDS (e.g. 900–1200)."
-        ) from e
-    except requests.HTTPError as e:
-        # If model was unloaded/missing, force pull and retry once.
-        if getattr(e.response, "status_code", None) == 404:
-            ensure_model_available(force_pull=True)
-            retry = requests.post(OLLAMA_API, json=payload, timeout=gen_timeout)
-            retry.raise_for_status()
-            return retry.json().get("response", "")
-        raise
+    response = requests.post(OLLAMA_API, json=payload, timeout=180)
+    response.raise_for_status()
 
-
-@app.on_event("startup")
-def _warm_ollama_model() -> None:
-    # Pre-warm on startup to avoid first-request 404 and long UI waits.
-    try:
-        ensure_model_available()
-    except Exception as e:
-        # Keep service booting; request path still retries.
-        print(f"[AI] Startup model warm-up warning: {e}")
+    return response.json().get("response", "")
 
 
 def safe_json_parse(text: str):
@@ -417,6 +192,8 @@ def split_resume_sections(text: str):
             sections[current] += line + "\n"
 
     return sections
+
+
 def extract_contact_info(text: str):
 
     email_match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
@@ -427,6 +204,8 @@ def extract_contact_info(text: str):
     phone = phone_match.group(0) if phone_match else ""
 
     return email, phone
+
+
 # ==============================
 # RESUME PARSER
 # ==============================
@@ -435,6 +214,7 @@ def parse_resume_to_schema(resume_text: str):
 
     sections = split_resume_sections(resume_text)
     email, phone = extract_contact_info(resume_text)
+
     prompt = f"""
 You are a resume parser.
 
@@ -602,33 +382,215 @@ CANDIDATE RESUME:
 
 
 # ==============================
+# ATS SCORING HELPERS
+# ==============================
+
+def normalize_text(text: str):
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def keyword_match_score(resume_text: str, keywords: list):
+    """
+    Calculates keyword coverage percentage.
+
+    Returns:
+    - score
+    - covered keywords
+    - missing keywords
+    """
+
+    normalized_resume = normalize_text(resume_text)
+
+    keywords = list(dict.fromkeys([
+        k.strip().lower()
+        for k in keywords
+        if isinstance(k, str) and k.strip()
+    ]))
+
+    covered = []
+    missing = []
+
+    for keyword in keywords:
+        keyword_norm = normalize_text(keyword)
+
+        if keyword_norm in normalized_resume:
+            covered.append(keyword)
+        else:
+            missing.append(keyword)
+
+    score = round((len(covered) / max(len(keywords), 1)) * 100, 2)
+
+    return score, covered, missing
+
+
+def responsibility_alignment_score(resume_text: str, responsibilities: list):
+    """
+    Scores whether resume content reflects job responsibilities,
+    not just isolated keywords.
+    """
+
+    normalized_resume = normalize_text(resume_text)
+
+    responsibilities = [
+        r.strip().lower()
+        for r in responsibilities
+        if isinstance(r, str) and r.strip()
+    ]
+
+    if not responsibilities:
+        return 60
+
+    matched = 0
+
+    stop_words = {
+        "with", "from", "that", "this", "will", "have",
+        "your", "their", "using", "work", "team", "role",
+        "able", "into", "over", "under", "within", "across",
+        "while", "also", "such", "including", "based"
+    }
+
+    for responsibility in responsibilities:
+
+        words = [
+            w for w in re.findall(r"\b[a-zA-Z]{4,}\b", responsibility)
+            if w not in stop_words
+        ]
+
+        if not words:
+            continue
+
+        overlap = sum(1 for w in words if w in normalized_resume)
+
+        if overlap / max(len(words), 1) >= 0.35:
+            matched += 1
+
+    return round((matched / max(len(responsibilities), 1)) * 100, 2)
+
+
+def quantified_achievement_score(resume: OptimizedResume):
+    """
+    Rewards bullets with measurable achievements, metrics,
+    or impact-focused wording.
+    """
+
+    all_bullets = []
+
+    for exp in resume.experiences:
+        all_bullets.extend(exp.bullets)
+
+    for project in resume.projects:
+        all_bullets.extend(project.bullets)
+
+    if not all_bullets:
+        return 40
+
+    quantified_count = 0
+
+    impact_terms = [
+        "increased",
+        "reduced",
+        "improved",
+        "optimized",
+        "decreased",
+        "saved",
+        "automated",
+        "accelerated",
+        "enhanced",
+        "delivered",
+        "achieved",
+        "boosted",
+        "streamlined",
+        "cut",
+        "grew",
+        "resolved"
+    ]
+
+    for bullet in all_bullets:
+
+        bullet_lower = bullet.lower()
+
+        has_number = bool(re.search(r"\d+|%|percent", bullet_lower))
+        has_impact = any(term in bullet_lower for term in impact_terms)
+
+        if has_number or has_impact:
+            quantified_count += 1
+
+    score = round((quantified_count / max(len(all_bullets), 1)) * 100, 2)
+
+    return min(score, 100)
+
+
+def structure_score(resume: OptimizedResume):
+    """
+    Checks resume completeness.
+    """
+
+    score = 0
+
+    if resume.summary and len(resume.summary.split()) >= 25:
+        score += 20
+
+    if resume.experiences:
+        score += 25
+
+    if resume.projects:
+        score += 20
+
+    if resume.education:
+        score += 15
+
+    if resume.skills:
+        score += 20
+
+    return score
+
+
+def keyword_stuffing_penalty(resume: OptimizedResume, jd_data: dict):
+    """
+    Penalizes unnatural keyword repetition.
+    """
+
+    resume_text = normalize_text(json.dumps(resume.model_dump()))
+
+    all_keywords = (
+        jd_data.get("must_have_keywords", []) +
+        jd_data.get("nice_to_have_keywords", []) +
+        jd_data.get("tools", [])
+    )
+
+    penalty = 0
+
+    for keyword in all_keywords:
+
+        keyword_norm = normalize_text(keyword)
+
+        if not keyword_norm:
+            continue
+
+        count = resume_text.count(keyword_norm)
+
+        if count >= 5:
+            penalty += 2
+
+    return min(penalty, 5)
+
+
+# ==============================
 # PASS 3: COVERAGE CHECK
 # ==============================
 
 def compute_coverage(resume: OptimizedResume, jd_data: dict):
 
-    must_have = [k.lower() for k in jd_data.get("must_have_keywords", []) if k and str(k).strip()]
+    must_have = jd_data.get("must_have_keywords", [])
 
-    # Score against the resume body only — exclude ats_report so the LLM's own
-    # keywords_covered/keywords_missing arrays don't trivially satisfy the check.
-    body = resume.model_dump(exclude={"ats_report"})
-    resume_text = json.dumps(body).lower()
+    resume_text = json.dumps(resume.model_dump())
 
-    def _matches(keyword: str) -> bool:
-        # Word-boundary match so "go" doesn't match "google", "sql" doesn't
-        # match "mysql"/"postgresql"/"nosql", etc.
-        pattern = r"(?<![A-Za-z0-9+#.])" + re.escape(keyword) + r"(?![A-Za-z0-9+#])"
-        return re.search(pattern, resume_text) is not None
-
-    covered = [k for k in must_have if _matches(k)]
-    missing = [k for k in must_have if not _matches(k)]
-
-    coverage_percent = round(
-        (len(covered) / max(len(must_have), 1)) * 100,
-        2
+    keyword_score, covered, missing = keyword_match_score(
+        resume_text,
+        must_have
     )
 
-    return coverage_percent, covered, missing
+    return keyword_score, covered, missing
 
 
 def improve_resume_if_needed(resume: OptimizedResume, jd_data: dict):
@@ -664,41 +626,64 @@ JOB SIGNALS:
 
 
 # ==============================
-# ATS KEYWORD SCORING
+# ATS KEYWORD + QUALITY SCORING
 # ==============================
 
 def compute_ats_score(resume: OptimizedResume, jd_data: dict):
 
-    coverage, covered, missing = compute_coverage(resume, jd_data)
+    resume_text = json.dumps(resume.model_dump())
+
+    must_score, must_covered, must_missing = keyword_match_score(
+        resume_text,
+        jd_data.get("must_have_keywords", [])
+    )
+
+    nice_tools_score, nice_tools_covered, nice_tools_missing = keyword_match_score(
+        resume_text,
+        jd_data.get("nice_to_have_keywords", []) + jd_data.get("tools", [])
+    )
+
+    responsibility_score = responsibility_alignment_score(
+        resume_text,
+        jd_data.get("responsibilities", [])
+    )
+
+    quantified_score = quantified_achievement_score(resume)
+
+    structural_score = structure_score(resume)
+
+    stuffing_penalty = keyword_stuffing_penalty(resume, jd_data)
+
+    raw_score = (
+        (must_score * 0.35) +
+        (nice_tools_score * 0.15) +
+        (responsibility_score * 0.20) +
+        (quantified_score * 0.15) +
+        (structural_score * 0.10) -
+        stuffing_penalty
+    )
+
+    final_score = round(raw_score, 2)
+
+    # Realistic cap so the score behaves more like online ATS checkers
+    final_score = max(0, min(final_score, 89))
 
     return {
-        "final_ats_score": coverage,
-        "keywords_found": covered,
-        "keywords_missing": missing
-    }
+        "final_ats_score": final_score,
 
+        # Same keys as before, so frontend remains compatible
+        "keywords_found": must_covered + nice_tools_covered,
+        "keywords_missing": must_missing + nice_tools_missing,
 
-def compute_initial_ats_score(req: "ResumeRequest", jd_data: dict):
-    """
-    Score the user's RAW input resume against the JD before any LLM rewriting.
-    Uses the same regex as compute_coverage so the two numbers are directly comparable.
-    """
-    must_have = [k.lower() for k in jd_data.get("must_have_keywords", []) if k and str(k).strip()]
-    body = req.model_dump(exclude={"job_description"})
-    resume_text = json.dumps(body).lower()
-
-    def _matches(keyword: str) -> bool:
-        pattern = r"(?<![A-Za-z0-9+#.])" + re.escape(keyword) + r"(?![A-Za-z0-9+#])"
-        return re.search(pattern, resume_text) is not None
-
-    covered = [k for k in must_have if _matches(k)]
-    missing = [k for k in must_have if not _matches(k)]
-    coverage = round((len(covered) / max(len(must_have), 1)) * 100, 2)
-
-    return {
-        "final_ats_score": coverage,
-        "keywords_found": covered,
-        "keywords_missing": missing,
+        # Extra details; frontend can ignore this if not used
+        "score_breakdown": {
+            "must_have_keyword_score": must_score,
+            "nice_to_have_tools_score": nice_tools_score,
+            "responsibility_alignment_score": responsibility_score,
+            "quantified_achievement_score": quantified_score,
+            "structure_score": structural_score,
+            "keyword_stuffing_penalty": stuffing_penalty
+        }
     }
 
 
@@ -706,7 +691,7 @@ def compute_initial_ats_score(req: "ResumeRequest", jd_data: dict):
 # IMPROVEMENT LOOP
 # ==============================
 
-def optimize_until_threshold(resume: OptimizedResume, jd_data: dict, threshold=90):
+def optimize_until_threshold(resume: OptimizedResume, jd_data: dict, threshold=78):
 
     max_iterations = 3
 
@@ -718,20 +703,26 @@ def optimize_until_threshold(resume: OptimizedResume, jd_data: dict, threshold=9
             return resume, ats, i + 1
 
         missing = ats["keywords_missing"]
+        breakdown = ats.get("score_breakdown", {})
 
         prompt = f"""
 The resume below has an ATS score of {ats["final_ats_score"]}.
 
 It must reach at least {threshold}.
 
+Current score breakdown:
+{json.dumps(breakdown, indent=2)}
+
 Missing keywords:
 {missing}
 
 Improve the resume by:
 - Integrating missing keywords naturally
+- Improving responsibility alignment with the job description
 - Strengthening quantified achievements
-- Maintaining structure
-- Not inventing companies or degrees
+- Making bullets more specific and impact-focused
+- Maintaining the same JSON structure
+- Not inventing companies, degrees, job titles, dates, or fake experience
 
 Return STRICT JSON in the same schema.
 
@@ -773,6 +764,7 @@ async def parse_resume(file: UploadFile = File(...)):
             detail=str(e)
         )
 
+
 # ==============================
 # GENERATOR ENDPOINT
 # ==============================
@@ -783,10 +775,6 @@ def generate_resume(req: ResumeRequest):
     try:
 
         jd_data = extract_jd_signals(req.job_description)
-
-        # Score the user's raw resume BEFORE any optimization, so the response
-        # includes both a real "before" baseline and the post-optimization "after".
-        initial_ats = compute_initial_ats_score(req, jd_data)
 
         optimized_resume = optimize_resume(req, jd_data)
 
@@ -814,17 +802,12 @@ def generate_resume(req: ResumeRequest):
 
             "jd_analysis": jd_data,
 
-            "ats_initial_result": {
-                "final_ats_score": initial_ats["final_ats_score"],
-                "keywords_found": initial_ats["keywords_found"],
-                "keywords_missing": initial_ats["keywords_missing"]
-            },
-
             "ats_final_result": {
                 "final_ats_score": ats_score["final_ats_score"],
                 "iterations_needed": iterations,
                 "keywords_found": ats_score["keywords_found"],
-                "keywords_missing": ats_score["keywords_missing"]
+                "keywords_missing": ats_score["keywords_missing"],
+                "score_breakdown": ats_score.get("score_breakdown", {})
             }
 
         }
