@@ -18,7 +18,7 @@ app = FastAPI(title="ResumeBuilderAI - Qwen Edition")
 
 OLLAMA_API = os.getenv("OLLAMA_API", "http://127.0.0.1:11434/api/generate")
 MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "600"))
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "840"))
 
 
 # ==============================
