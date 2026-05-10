@@ -967,3 +967,241 @@ def generate_cover_letter(req: CoverLetterRequest):
         stream_ollama(prompt, temperature=0.6),
         media_type="text/plain; charset=utf-8",
     )
+
+
+class HREmailDraftsRequest(BaseModel):
+    resume: Optional[ResumeRequest] = None
+    resume_text: Optional[str] = None
+    job_description: Optional[str] = None
+    tone: Optional[str] = "professional"
+    company: Optional[str] = None
+    role: Optional[str] = None
+    email_type: Optional[str] = "application"
+    recipient_name: Optional[str] = None
+    job_link: Optional[str] = None
+    date_applied: Optional[str] = None
+    availability: Optional[str] = None
+    extra_context: Optional[str] = None
+    drafts: int = 3
+
+
+_EMAIL_TYPE_HINTS: Dict[str, str] = {
+    "application": "An email to a recruiter/HR submitting an application (or sharing the resume) with a clear subject, brief fit, and a polite call-to-action.",
+    "follow_up": "A follow-up email after applying with a short reminder, relevance, and a respectful request for an update.",
+    "thank_you": "A thank-you email after an interview (or recruiter call) expressing appreciation, reinforcing fit, and confirming next steps.",
+    "scheduling": "An email to coordinate interview times, offering availability windows and confirming time zone.",
+    "referral_request": "An email asking for a referral or internal introduction, succinctly explaining fit and including the job link.",
+    "offer_clarification": "An email requesting clarification on an offer (scope, start date, compensation components) in a positive, professional tone.",
+    "negotiation": "An email negotiating compensation with data-driven framing and clear asks, while remaining collaborative.",
+}
+
+
+def _build_hr_email_drafts_prompt(
+    resume_text: str,
+    job_description: str,
+    tone: str,
+    company: Optional[str],
+    role: Optional[str],
+    email_type: str,
+    recipient_name: Optional[str],
+    job_link: Optional[str],
+    date_applied: Optional[str],
+    availability: Optional[str],
+    extra_context: Optional[str],
+    drafts: int,
+) -> str:
+    tone_hint = _TONE_HINTS.get(tone, _TONE_HINTS["professional"])
+    type_hint = _EMAIL_TYPE_HINTS.get(email_type, _EMAIL_TYPE_HINTS["application"])
+    target = ""
+    if role and company:
+        target = f"\nROLE: {role} at {company}"
+    elif role:
+        target = f"\nROLE: {role}"
+    elif company:
+        target = f"\nCOMPANY: {company}"
+
+    ctx_lines: List[str] = []
+    if recipient_name:
+        ctx_lines.append(f"RECIPIENT_NAME: {recipient_name}")
+    if job_link:
+        ctx_lines.append(f"JOB_LINK: {job_link}")
+    if date_applied:
+        ctx_lines.append(f"DATE_APPLIED: {date_applied}")
+    if availability:
+        ctx_lines.append(f"AVAILABILITY: {availability}")
+    if extra_context:
+        ctx_lines.append(f"EXTRA_CONTEXT: {extra_context}")
+    ctx = "\n".join(ctx_lines).strip() or "None"
+
+    n = max(1, min(int(drafts or 3), 5))
+    jd = (job_description or "").strip()
+    if not jd:
+        jd = "Not provided."
+
+    return f"""You are an expert recruiter-facing email writer. Write {n} distinct HR/recruiter email drafts in {tone_hint} tone.
+
+Email scenario:
+- {email_type}: {type_hint}
+{target}
+
+Hard rules:
+- Output MUST be plain text only.
+- Output MUST include exactly {n} drafts.
+- Each draft MUST start with a separator line exactly like: === DRAFT X === (where X is 1..{n})
+- Each draft MUST include:
+  - Subject: <one line>
+  - Body: <email body with greeting + 2–4 short paragraphs + sign-off with candidate name if available>
+- Do not invent employers, degrees, dates, or skills not in the resume.
+- Keep each body under ~170 words (except negotiation/offer_clarification can be up to ~220).
+- Never use placeholders like [Your Name] or [Company] — use the best available info, otherwise omit.
+- If attachments are mentioned, say they are attached (resume/cover letter) without listing file names.
+
+Context:
+{ctx}
+
+JOB DESCRIPTION:
+{jd}
+
+CANDIDATE RESUME:
+{resume_text}
+
+Write the {n} drafts now:"""
+
+
+@app.post("/generate_hr_email_drafts")
+def generate_hr_email_drafts(req: HREmailDraftsRequest):
+    if req.resume is not None:
+        resume_text = _resume_to_plaintext(req.resume)
+    elif req.resume_text and req.resume_text.strip():
+        resume_text = req.resume_text.strip()
+    else:
+        raise HTTPException(status_code=400, detail="Provide either `resume` or `resume_text`")
+
+    prompt = _build_hr_email_drafts_prompt(
+        resume_text=resume_text,
+        job_description=(req.job_description or ""),
+        tone=(req.tone or "professional").lower(),
+        company=req.company,
+        role=req.role,
+        email_type=(req.email_type or "application").lower(),
+        recipient_name=req.recipient_name,
+        job_link=req.job_link,
+        date_applied=req.date_applied,
+        availability=req.availability,
+        extra_context=req.extra_context,
+        drafts=req.drafts,
+    )
+
+    return StreamingResponse(
+        stream_ollama(prompt, temperature=0.55),
+        media_type="text/plain; charset=utf-8",
+    )
+
+
+class QAAnswersRequest(BaseModel):
+    resume: Optional[ResumeRequest] = None
+    resume_text: Optional[str] = None
+    job_description: str
+    tone: Optional[str] = "professional"
+    company: Optional[str] = None
+    role: Optional[str] = None
+    interview_type: Optional[str] = "screening"
+    focus: Optional[str] = None
+    question_count: int = 10
+    questions: Optional[List[str]] = None
+
+
+_INTERVIEW_TYPE_HINTS: Dict[str, str] = {
+    "screening": "HR/recruiter screening: motivation, resume walkthrough, role fit, communication, logistics.",
+    "behavioral": "Behavioral interview: STAR stories, collaboration, conflict, ownership, leadership, impact.",
+    "technical": "Technical interview: problem solving, system thinking, fundamentals, trade-offs, clarity under pressure.",
+    "manager": "Hiring manager interview: scope, autonomy, prioritization, stakeholder alignment, delivery, impact.",
+}
+
+
+def _build_qa_answers_prompt(
+    resume_text: str,
+    job_description: str,
+    tone: str,
+    company: Optional[str],
+    role: Optional[str],
+    interview_type: str,
+    focus: Optional[str],
+    question_count: int,
+    questions: Optional[List[str]],
+) -> str:
+    tone_hint = _TONE_HINTS.get(tone, _TONE_HINTS["professional"])
+    interview_hint = _INTERVIEW_TYPE_HINTS.get(interview_type, _INTERVIEW_TYPE_HINTS["screening"])
+    target = ""
+    if role and company:
+        target = f"\nROLE: {role} at {company}"
+    elif role:
+        target = f"\nROLE: {role}"
+    elif company:
+        target = f"\nCOMPANY: {company}"
+
+    n = max(5, min(int(question_count or 10), 20))
+    focus_line = f"\nFOCUS: {focus}" if focus and focus.strip() else ""
+    provided_qs = ""
+    if questions:
+        cleaned = [q.strip() for q in questions if q and q.strip()]
+        if cleaned:
+            provided_qs = "\nPROVIDED_QUESTIONS:\n" + "\n".join([f"- {q}" for q in cleaned])
+
+    return f"""You are an interview coach. Create a Q&A answer pack in {tone_hint} tone.
+
+Interview type:
+- {interview_type}: {interview_hint}
+{target}{focus_line}
+
+Hard rules:
+- Output MUST be plain text only.
+- Output MUST include exactly {n} Q&A items.
+- Each item MUST start with a separator line exactly like: === QX === (where X is 1..{n})
+- Each item MUST include:
+  - Question: <one line>
+  - Answer: <120–220 words; conversational; no fluff; tailored to the resume + job description>
+  - Key points: <3–5 bullets starting with "- ">
+  - Follow-up: <one likely follow-up question>
+- Do not invent jobs, employers, dates, certifications, or tools not in the resume.
+- Use specific achievements and technologies only if present in the resume text.
+- Avoid company hype; be authentic and concrete.
+{provided_qs}
+
+JOB DESCRIPTION:
+{job_description}
+
+CANDIDATE RESUME:
+{resume_text}
+
+Produce the {n} Q&A items now:"""
+
+
+@app.post("/generate_qa_answers")
+def generate_qa_answers(req: QAAnswersRequest):
+    if not (req.job_description or "").strip():
+        raise HTTPException(status_code=400, detail="job_description is required")
+
+    if req.resume is not None:
+        resume_text = _resume_to_plaintext(req.resume)
+    elif req.resume_text and req.resume_text.strip():
+        resume_text = req.resume_text.strip()
+    else:
+        raise HTTPException(status_code=400, detail="Provide either `resume` or `resume_text`")
+
+    prompt = _build_qa_answers_prompt(
+        resume_text=resume_text,
+        job_description=req.job_description.strip(),
+        tone=(req.tone or "professional").lower(),
+        company=req.company,
+        role=req.role,
+        interview_type=(req.interview_type or "screening").lower(),
+        focus=req.focus,
+        question_count=req.question_count,
+        questions=req.questions,
+    )
+
+    return StreamingResponse(
+        stream_ollama(prompt, temperature=0.5),
+        media_type="text/plain; charset=utf-8",
+    )
