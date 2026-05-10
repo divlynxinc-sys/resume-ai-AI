@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Generator
 import os
 import requests
 import json
@@ -820,3 +821,149 @@ def generate_resume(req: ResumeRequest):
             status_code=500,
             detail=str(e)
         )
+
+
+# ==============================
+# COVER LETTER GENERATION
+# ==============================
+
+class CoverLetterRequest(BaseModel):
+    # Either send a structured resume (preferred) or a plain-text resume.
+    resume: Optional[ResumeRequest] = None
+    resume_text: Optional[str] = None
+    job_description: str
+    tone: Optional[str] = "professional"  # professional | enthusiastic | concise | warm
+    company: Optional[str] = None
+    role: Optional[str] = None
+
+
+def _resume_to_plaintext(r: ResumeRequest) -> str:
+    lines: List[str] = []
+    if r.name:
+        lines.append(r.name)
+    contact_bits = [b for b in [r.email, r.phone, r.linkedin, r.portfolio] if b]
+    if contact_bits:
+        lines.append(" | ".join(contact_bits))
+    if r.summary:
+        lines.append(f"\nSUMMARY\n{r.summary}")
+    if r.experiences:
+        lines.append("\nEXPERIENCE")
+        for e in r.experiences:
+            header = " — ".join([p for p in [e.role, e.company] if p])
+            dates = " – ".join([p for p in [e.startDate, e.endDate] if p])
+            lines.append(f"{header} ({dates})" if dates else header)
+            for b in e.bullets:
+                lines.append(f"- {b}")
+    if r.projects:
+        lines.append("\nPROJECTS")
+        for p in r.projects:
+            lines.append(p.title)
+            for b in p.bullets:
+                lines.append(f"- {b}")
+    if r.education:
+        lines.append("\nEDUCATION")
+        for ed in r.education:
+            lines.append(" — ".join([p for p in [ed.degree, ed.field, ed.school] if p]))
+    if r.skills:
+        lines.append("\nSKILLS")
+        for cat in r.skills:
+            lines.append(f"{cat.category}: {', '.join(cat.skills)}")
+    return "\n".join(lines).strip()
+
+
+_TONE_HINTS = {
+    "professional": "polished, confident, neutral",
+    "enthusiastic": "warm, energetic, genuinely excited",
+    "concise": "tight, direct, no fluff — under 220 words",
+    "warm": "personable, conversational, sincere",
+}
+
+
+def _build_cover_letter_prompt(
+    resume_text: str,
+    job_description: str,
+    tone: str,
+    company: Optional[str],
+    role: Optional[str],
+) -> str:
+    tone_hint = _TONE_HINTS.get(tone, _TONE_HINTS["professional"])
+    target = ""
+    if role and company:
+        target = f"\nROLE: {role} at {company}"
+    elif role:
+        target = f"\nROLE: {role}"
+    elif company:
+        target = f"\nCOMPANY: {company}"
+
+    return f"""You are an expert career writer. Write a cover letter in {tone_hint} tone.
+
+Rules:
+- 3 short paragraphs (opening, fit, close).
+- Pull SPECIFIC achievements from the resume that match the job description.
+- Do not invent jobs, employers, dates, or skills the candidate doesn't have.
+- Do not list bullet points. Write flowing prose.
+- Do not include placeholders like [Your Name] or [Date] — only the letter body.
+- Do not repeat the resume verbatim.
+- Start with "Dear Hiring Manager," and end with "Sincerely," followed by the candidate's name on a new line.
+{target}
+
+JOB DESCRIPTION:
+{job_description}
+
+CANDIDATE RESUME:
+{resume_text}
+
+Write the cover letter now:"""
+
+
+def stream_ollama(prompt: str, temperature: float = 0.6) -> Generator[bytes, None, None]:
+    payload = {
+        "model": MODEL,
+        "prompt": prompt,
+        "stream": True,
+        "options": {
+            "temperature": temperature,
+            "top_p": 0.9,
+            "num_ctx": 4096,
+        },
+    }
+    with requests.post(OLLAMA_API, json=payload, stream=True, timeout=OLLAMA_TIMEOUT) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                obj = json.loads(line.decode("utf-8"))
+            except Exception:
+                continue
+            chunk = obj.get("response", "")
+            if chunk:
+                yield chunk.encode("utf-8")
+            if obj.get("done"):
+                break
+
+
+@app.post("/generate_cover_letter")
+def generate_cover_letter(req: CoverLetterRequest):
+    if not (req.job_description or "").strip():
+        raise HTTPException(status_code=400, detail="job_description is required")
+
+    if req.resume is not None:
+        resume_text = _resume_to_plaintext(req.resume)
+    elif req.resume_text and req.resume_text.strip():
+        resume_text = req.resume_text.strip()
+    else:
+        raise HTTPException(status_code=400, detail="Provide either `resume` or `resume_text`")
+
+    prompt = _build_cover_letter_prompt(
+        resume_text=resume_text,
+        job_description=req.job_description.strip(),
+        tone=(req.tone or "professional").lower(),
+        company=req.company,
+        role=req.role,
+    )
+
+    return StreamingResponse(
+        stream_ollama(prompt, temperature=0.6),
+        media_type="text/plain; charset=utf-8",
+    )
