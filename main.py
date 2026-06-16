@@ -21,6 +21,18 @@ OLLAMA_API = os.getenv("OLLAMA_API", "http://127.0.0.1:11434/api/generate")
 MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct-q4_K_M")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "600"))
 
+# --- Hosted LLM (OpenAI-compatible, e.g. Groq) --------------------------------
+# When LLM_API_KEY is set, the service calls a hosted OpenAI-compatible Chat
+# Completions API instead of local Ollama. This is fast and needs NO GPU, which
+# makes it the right fit for CPU-only hosts like Railway. When the key is empty
+# we transparently fall back to Ollama (used by the docker-compose dev stack).
+#   Groq:  LLM_BASE_URL=https://api.groq.com/openai/v1  LLM_MODEL=llama-3.3-70b-versatile
+LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("GROQ_API_KEY", "")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "120"))
+USE_HOSTED_LLM = bool(LLM_API_KEY)
+
 
 # ==============================
 # DATA MODELS
@@ -81,7 +93,67 @@ class OptimizedResume(BaseModel):
 # OLLAMA CALL
 # ==============================
 
+def _hosted_headers():
+    return {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
+
+
+def _hosted_complete(prompt: str, *, temperature: float = 0.15, json_mode: bool = False) -> str:
+    """Blocking chat-completion against the hosted OpenAI-compatible API (returns text)."""
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    resp = requests.post(
+        f"{LLM_BASE_URL}/chat/completions",
+        headers=_hosted_headers(),
+        json=payload,
+        timeout=LLM_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
+
+
+def _hosted_stream(prompt: str, temperature: float = 0.6) -> Generator[bytes, None, None]:
+    """Streaming chat-completion against the hosted OpenAI-compatible API (SSE)."""
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "stream": True,
+    }
+    with requests.post(
+        f"{LLM_BASE_URL}/chat/completions",
+        headers=_hosted_headers(),
+        json=payload,
+        stream=True,
+        timeout=LLM_TIMEOUT,
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if line.startswith("data:"):
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except Exception:
+                    continue
+                delta = ((obj.get("choices") or [{}])[0].get("delta") or {})
+                chunk = delta.get("content")
+                if chunk:
+                    yield chunk.encode("utf-8")
+
+
 def call_ollama(prompt: str):
+    # Hosted API (Groq etc.) when configured; otherwise local Ollama.
+    if USE_HOSTED_LLM:
+        return _hosted_complete(prompt, temperature=0.15, json_mode=True)
 
     payload = {
         "model": MODEL,
@@ -917,6 +989,11 @@ Write the cover letter now:"""
 
 
 def stream_ollama(prompt: str, temperature: float = 0.6) -> Generator[bytes, None, None]:
+    # Hosted API (Groq etc.) when configured; otherwise local Ollama.
+    if USE_HOSTED_LLM:
+        yield from _hosted_stream(prompt, temperature)
+        return
+
     payload = {
         "model": MODEL,
         "prompt": prompt,
@@ -961,6 +1038,242 @@ def generate_cover_letter(req: CoverLetterRequest):
         tone=(req.tone or "professional").lower(),
         company=req.company,
         role=req.role,
+    )
+
+    return StreamingResponse(
+        stream_ollama(prompt, temperature=0.6),
+        media_type="text/plain; charset=utf-8",
+    )
+
+
+# ==============================
+# Q&A ANSWERS GENERATION
+# ==============================
+
+class QAAnswersRequest(BaseModel):
+    resume: Optional[ResumeRequest] = None
+    resume_text: Optional[str] = None
+    job_description: str
+    tone: Optional[str] = "professional"
+    company: Optional[str] = None
+    role: Optional[str] = None
+    interview_type: Optional[str] = "behavioral"  # screening | behavioral | technical | manager
+    focus: Optional[str] = None
+    question_count: Optional[int] = 6
+    questions: Optional[List[str]] = None
+
+
+_INTERVIEW_TYPE_HINTS = {
+    "screening": "recruiter phone-screen questions (motivation, background basics, logistics, salary)",
+    "behavioral": "behavioral questions answered in STAR form (Situation, Task, Action, Result)",
+    "technical": "role-specific technical questions that probe depth and trade-offs",
+    "manager": "hiring-manager questions about impact, ownership, collaboration, and fit",
+}
+
+
+def _resume_or_text(resume: Optional[ResumeRequest], resume_text: Optional[str]) -> str:
+    if resume is not None:
+        return _resume_to_plaintext(resume)
+    if resume_text and resume_text.strip():
+        return resume_text.strip()
+    return ""
+
+
+def _target_line(role: Optional[str], company: Optional[str]) -> str:
+    if role and company:
+        return f"\nROLE: {role} at {company}"
+    if role:
+        return f"\nROLE: {role}"
+    if company:
+        return f"\nCOMPANY: {company}"
+    return ""
+
+
+def _build_qa_prompt(
+    resume_text: str,
+    job_description: str,
+    tone: str,
+    company: Optional[str],
+    role: Optional[str],
+    interview_type: str,
+    focus: Optional[str],
+    question_count: int,
+    questions: Optional[List[str]],
+) -> str:
+    tone_hint = _TONE_HINTS.get(tone, _TONE_HINTS["professional"])
+    type_hint = _INTERVIEW_TYPE_HINTS.get(interview_type, _INTERVIEW_TYPE_HINTS["behavioral"])
+    target = _target_line(role, company)
+    focus_line = f"\nFOCUS AREAS: {focus}" if focus else ""
+
+    if questions:
+        numbered = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
+        task = (
+            "Answer EACH of the interview questions below. Write the answer in the FIRST PERSON "
+            "as the candidate, grounded in the candidate's real resume and tailored to the job description."
+        )
+        questions_block = f"\nQUESTIONS TO ANSWER:\n{numbered}\n"
+    else:
+        task = (
+            f"Generate {question_count} likely {type_hint} for this role, and for EACH one write a strong, "
+            "specific answer in the FIRST PERSON as the candidate, grounded in the resume and tailored to the job."
+        )
+        questions_block = ""
+
+    return f"""You are an expert interview coach helping a candidate prepare. {task}
+
+Tone: {tone_hint}.
+Interview type: {type_hint}.{target}{focus_line}
+
+Rules:
+- Use ONLY real experience from the candidate's resume. Do NOT invent employers, titles, dates, or skills.
+- Be concrete: reference specific projects, technologies, and measurable results from the resume.
+- Keep each answer roughly 90–160 words. Natural spoken prose, not bullet lists.
+- Output PLAIN TEXT only. For each item use exactly this format:
+
+Q: <the question>
+A: <the answer>
+
+(blank line between items). No markdown, no numbering, no preamble, no closing remarks.
+{questions_block}
+JOB DESCRIPTION:
+{job_description}
+
+CANDIDATE RESUME:
+{resume_text or "(no resume provided — answer generically but plausibly for this role)"}
+
+Begin now:"""
+
+
+@app.post("/generate_qa_answers")
+def generate_qa_answers(req: QAAnswersRequest):
+    if not (req.job_description or "").strip():
+        raise HTTPException(status_code=400, detail="job_description is required")
+
+    prompt = _build_qa_prompt(
+        resume_text=_resume_or_text(req.resume, req.resume_text),
+        job_description=req.job_description.strip(),
+        tone=(req.tone or "professional").lower(),
+        company=req.company,
+        role=req.role,
+        interview_type=(req.interview_type or "behavioral").lower(),
+        focus=req.focus,
+        question_count=max(1, min(int(req.question_count or 6), 15)),
+        questions=[q for q in (req.questions or []) if q and q.strip()] or None,
+    )
+
+    return StreamingResponse(
+        stream_ollama(prompt, temperature=0.5),
+        media_type="text/plain; charset=utf-8",
+    )
+
+
+# ==============================
+# HR EMAIL DRAFTS GENERATION
+# ==============================
+
+class HREmailRequest(BaseModel):
+    resume: Optional[ResumeRequest] = None
+    resume_text: Optional[str] = None
+    job_description: Optional[str] = None
+    tone: Optional[str] = "professional"
+    company: Optional[str] = None
+    role: Optional[str] = None
+    email_type: Optional[str] = "application"
+    recipient_name: Optional[str] = None
+    job_link: Optional[str] = None
+    date_applied: Optional[str] = None
+    availability: Optional[str] = None
+    extra_context: Optional[str] = None
+    drafts: Optional[int] = 2
+
+
+_EMAIL_TYPE_HINTS = {
+    "application": "a job application email introducing the candidate and expressing interest",
+    "follow_up": "a polite follow-up email checking on application status",
+    "thank_you": "a thank-you email after an interview",
+    "scheduling": "an email proposing/confirming interview scheduling and availability",
+    "referral_request": "an email requesting a referral or introduction",
+    "offer_clarification": "an email asking clarifying questions about a job offer",
+    "negotiation": "a professional salary/offer negotiation email",
+}
+
+
+def _build_hr_email_prompt(
+    resume_text: str,
+    job_description: Optional[str],
+    tone: str,
+    company: Optional[str],
+    role: Optional[str],
+    email_type: str,
+    recipient_name: Optional[str],
+    job_link: Optional[str],
+    date_applied: Optional[str],
+    availability: Optional[str],
+    extra_context: Optional[str],
+    drafts: int,
+) -> str:
+    tone_hint = _TONE_HINTS.get(tone, _TONE_HINTS["professional"])
+    type_hint = _EMAIL_TYPE_HINTS.get(email_type, _EMAIL_TYPE_HINTS["application"])
+    target = _target_line(role, company)
+
+    context_bits = []
+    if recipient_name:
+        context_bits.append(f"RECIPIENT: {recipient_name}")
+    if job_link:
+        context_bits.append(f"JOB LINK: {job_link}")
+    if date_applied:
+        context_bits.append(f"DATE APPLIED: {date_applied}")
+    if availability:
+        context_bits.append(f"AVAILABILITY: {availability}")
+    if extra_context:
+        context_bits.append(f"EXTRA CONTEXT: {extra_context}")
+    context_block = ("\n" + "\n".join(context_bits)) if context_bits else ""
+
+    plural = "drafts" if drafts > 1 else "draft"
+    greeting = f"Dear {recipient_name}," if recipient_name else "Dear Hiring Manager,"
+    # Precompute the optional job-description block: f-string expression parts can't
+    # contain backslashes on Python < 3.12, so build any newline-containing pieces here.
+    jd_block = f"JOB DESCRIPTION:\n{job_description}\n\n" if (job_description or "").strip() else ""
+    resume_block = resume_text or "(no resume provided — write plausibly using the context above)"
+
+    return f"""You are an expert career communication writer. Write {drafts} distinct {plural} of {type_hint}.
+
+Tone: {tone_hint}.{target}{context_block}
+
+Rules:
+- Each draft must be self-contained and ready to send.
+- Use ONLY real details from the candidate's resume; do NOT invent facts.
+- Keep each email concise (under ~160 words) and specific to the role/company.
+- Start the body with "{greeting}" and end with "Best regards," followed by the candidate's name.
+- Output PLAIN TEXT only. For each draft use exactly this format:
+
+--- Draft N ---
+Subject: <subject line>
+<email body>
+
+No markdown, no commentary before or after the drafts.
+
+{jd_block}CANDIDATE RESUME:
+{resume_block}
+
+Write the {plural} now:"""
+
+
+@app.post("/generate_hr_email")
+def generate_hr_email(req: HREmailRequest):
+    prompt = _build_hr_email_prompt(
+        resume_text=_resume_or_text(req.resume, req.resume_text),
+        job_description=req.job_description,
+        tone=(req.tone or "professional").lower(),
+        company=req.company,
+        role=req.role,
+        email_type=(req.email_type or "application").lower(),
+        recipient_name=req.recipient_name,
+        job_link=req.job_link,
+        date_applied=req.date_applied,
+        availability=req.availability,
+        extra_context=req.extra_context,
+        drafts=max(1, min(int(req.drafts or 2), 4)),
     )
 
     return StreamingResponse(
