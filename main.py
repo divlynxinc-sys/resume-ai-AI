@@ -977,6 +977,7 @@ Rules:
 - Do not include placeholders like [Your Name] or [Date] — only the letter body.
 - Do not repeat the resume verbatim.
 - Start with "Dear Hiring Manager," and end with "Sincerely," followed by the candidate's name on a new line.
+- CRITICAL: Only reference company names, team locations, technologies, or job specifics that are explicitly stated in the JOB DESCRIPTION. Do NOT copy candidate preferences or aspirations from the resume summary (e.g. "open to remote roles with Australian teams") into the letter as if they are facts about this specific job.
 {target}
 
 JOB DESCRIPTION:
