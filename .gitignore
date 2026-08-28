@@ -8,3 +8,6 @@ venv/
 .env
 .env.local
 *.log
+
+# Claude Code local instruction layer (knowledge-base rules) — never commit
+CLAUDE.local.md

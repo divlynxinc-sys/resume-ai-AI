@@ -29,7 +29,10 @@ OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "600"))
 #   Groq:  LLM_BASE_URL=https://api.groq.com/openai/v1  LLM_MODEL=llama-3.3-70b-versatile
 LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("GROQ_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
-LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+# 2026-08-28: Groq retired `llama-3.3-70b-versatile` (API now returns 404
+# model_not_found for it). `openai/gpt-oss-120b` is the closest replacement on the
+# same free tier and supports response_format=json_object. Override via LLM_MODEL.
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "120"))
 USE_HOSTED_LLM = bool(LLM_API_KEY)
 
@@ -1281,3 +1284,201 @@ def generate_hr_email(req: HREmailRequest):
         stream_ollama(prompt, temperature=0.6),
         media_type="text/plain; charset=utf-8",
     )
+
+
+# ==============================
+# AI INTERVIEWS — POST-INTERVIEW REPORT
+# ==============================
+# Called by resumeai-backend (app/utils/interviews.py::generate_report) once the
+# live LiveKit interview has ended and the worker has posted the transcript.
+# Input is text only (no audio ever reaches this service). Output is validated
+# again by the backend before it is stored, so this endpoint focuses on getting
+# a well-grounded JSON evaluation out of the model.
+
+INTERVIEW_SCORE_WEIGHTS = {
+    "relevance": 0.30,
+    "evidence": 0.25,
+    "structure": 0.15,
+    "role_alignment": 0.20,
+    "communication": 0.10,
+}
+INTERVIEW_TRANSCRIPT_MAX_CHARS = 24000
+INTERVIEW_EVAL_VERSION = "interview-eval-v1"
+
+_INTERVIEW_TYPE_LABELS = {
+    "general": "general",
+    "behavioural": "behavioural (STAR-style)",
+    "technical": "technical",
+    "hr_screening": "HR screening",
+    "leadership": "leadership",
+}
+_SENIORITY_LABELS = {
+    "entry": "entry level",
+    "mid": "mid-level",
+    "senior": "senior",
+    "lead": "lead / manager",
+}
+
+
+class InterviewTurn(BaseModel):
+    role: str
+    text: str
+
+
+class InterviewReportRequest(BaseModel):
+    role_title: str
+    interview_type: str = "general"
+    seniority: str = "mid"
+    duration_minutes: int = 15
+    resume: Optional[Dict] = None
+    job_description: Optional[str] = None
+    transcript: List[InterviewTurn]
+
+
+def _interview_resume_brief(resume: Optional[Dict]) -> str:
+    """Compact, prompt-friendly text of the résumé snapshot (no contact details)."""
+    if not isinstance(resume, dict) or not resume:
+        return "No résumé was provided."
+    lines: List[str] = []
+    if resume.get("summary"):
+        lines.append(f"Summary: {str(resume['summary'])[:600]}")
+    for e in (resume.get("experiences") or [])[:8]:
+        if not isinstance(e, dict):
+            continue
+        head = " — ".join([p for p in [e.get("role"), e.get("company")] if p])
+        dates = " to ".join([p for p in [e.get("startDate"), e.get("endDate")] if p])
+        lines.append(f"Experience: {head} ({dates})" if dates else f"Experience: {head}")
+        for b in (e.get("bullets") or [])[:5]:
+            lines.append(f"  - {str(b)[:220]}")
+    for p in (resume.get("projects") or [])[:6]:
+        if not isinstance(p, dict):
+            continue
+        lines.append(f"Project: {p.get('title') or 'Untitled project'}")
+        for b in (p.get("bullets") or [])[:4]:
+            lines.append(f"  - {str(b)[:220]}")
+    skills: List[str] = []
+    for cat in resume.get("skills") or []:
+        if isinstance(cat, dict):
+            skills.extend([str(x) for x in (cat.get("skills") or [])])
+        elif isinstance(cat, str):
+            skills.append(cat)
+    if skills:
+        lines.append("Skills: " + ", ".join(skills[:40]))
+    for ed in (resume.get("education") or [])[:4]:
+        if isinstance(ed, dict):
+            lines.append("Education: " + " — ".join([p for p in [ed.get("degree"), ed.get("field"), ed.get("school")] if p]))
+    return "\n".join(lines) if lines else "No résumé was provided."
+
+
+def _interview_transcript_text(turns: List[InterviewTurn]) -> str:
+    out: List[str] = []
+    for i, t in enumerate(turns):
+        role = "INTERVIEWER" if t.role == "assistant" else "CANDIDATE"
+        text = " ".join(str(t.text or "").split())
+        if text:
+            out.append(f"[{i + 1}] {role}: {text}")
+    text = "\n".join(out)
+    if len(text) > INTERVIEW_TRANSCRIPT_MAX_CHARS:
+        text = text[-INTERVIEW_TRANSCRIPT_MAX_CHARS:]
+        cut = text.find("\n[")
+        text = "(earlier turns truncated)\n" + (text[cut + 1:] if cut >= 0 else text)
+    return text
+
+
+def _build_interview_report_prompt(req: InterviewReportRequest) -> str:
+    jd = " ".join(str(req.job_description or "").split())[:6000] or "Not provided."
+    return f"""You are a fair, rigorous interview assessor. Evaluate the CANDIDATE in the spoken mock-interview transcript below and return ONLY a JSON object.
+
+TARGET ROLE: {req.role_title}
+INTERVIEW TYPE: {_INTERVIEW_TYPE_LABELS.get(req.interview_type, req.interview_type)}
+SENIORITY BEING ASSESSED: {_SENIORITY_LABELS.get(req.seniority, req.seniority)}
+
+CANDIDATE RÉSUMÉ (context only — do not score the résumé itself):
+{_interview_resume_brief(req.resume)}
+
+JOB DESCRIPTION:
+{jd}
+
+TRANSCRIPT (spoken, so expect fillers and small transcription errors):
+{_interview_transcript_text(req.transcript)}
+
+GROUNDING RULES (strict):
+- Base every judgement ONLY on what the candidate actually said in the transcript. Never invent achievements, numbers, employers, or details that are not there. "evidence" must paraphrase or quote the candidate's own words.
+- Score the CONTENT and STRUCTURE of the answers. Never score accent, grammar slips, fillers, transcription noise, personality, or anything about protected characteristics.
+- Calibrate expectations to the seniority above (an entry-level candidate is not expected to talk about architecture strategy; a senior one is).
+- Short or off-topic answers score low on relevance/evidence; do not pad them with charity.
+
+WHAT TO RETURN:
+1. "questions": the interviewer's substantive questions, in order (skip greetings, small talk, "are you ready", and the closing). Give each a stable id "q1", "q2", ... and a short category (e.g. "warm_up", "experience", "project", "technical", "behavioural", "role_fit", "follow_up"). Mark follow-ups with "is_follow_up": true.
+2. "answers": one entry per question that the candidate actually answered. "transcript" = the candidate's answer, verbatim from the transcript (merge consecutive candidate turns; light cleanup of fillers is fine; do not paraphrase). Each answer has:
+   - "scores": integers 0-100 for relevance (answers what was asked), evidence (specific, concrete, first-hand details and outcomes), structure (clear beginning/context/actions/result), role_alignment (how well it maps to the target role, JD and seniority), communication (clarity and concision of the spoken answer)
+   - "evidence": 1-2 sentences pointing to what in the answer supports the scores
+   - "worked": 1-3 short bullets of what was good
+   - "improvements": 1-3 short, specific bullets
+   - "improved_outline": 3-5 short bullets showing a stronger way to structure THIS answer using only facts the candidate mentioned
+3. "report": overall view across all answers:
+   - "scores": the same five dimensions, 0-100, reflecting the whole interview
+   - "summary": 1-2 sentences of honest overall assessment
+   - "strengths": 3 bullets, "improvements": 3 bullets (highest impact first), "action_plan": 4 concrete practice actions for before the real interview
+
+Return valid JSON only, in exactly this shape:
+{{
+  "questions": [{{"id": "q1", "prompt": "...", "category": "warm_up", "is_follow_up": false}}],
+  "answers": [{{"question_id": "q1", "transcript": "...", "scores": {{"relevance": 0, "evidence": 0, "structure": 0, "role_alignment": 0, "communication": 0}}, "evidence": "...", "worked": ["..."], "improvements": ["..."], "improved_outline": ["..."]}}],
+  "report": {{"scores": {{"relevance": 0, "evidence": 0, "structure": 0, "role_alignment": 0, "communication": 0}}, "summary": "...", "strengths": ["..."], "improvements": ["..."], "action_plan": ["..."]}}
+}}"""
+
+
+def _clamp_interview_score(value) -> int:
+    try:
+        return max(0, min(100, int(round(float(value)))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalize_interview_scores(scores) -> Dict[str, int]:
+    scores = scores if isinstance(scores, dict) else {}
+    return {k: _clamp_interview_score(scores.get(k, 0)) for k in INTERVIEW_SCORE_WEIGHTS}
+
+
+def interview_overall_score(scores: Dict[str, int]) -> int:
+    """Deterministic weighted overall — computed here in Python, never by the model."""
+    return int(round(sum(scores.get(k, 0) * w for k, w in INTERVIEW_SCORE_WEIGHTS.items())))
+
+
+@app.post("/interview/report")
+def interview_report(req: InterviewReportRequest):
+    candidate_turns = [t for t in req.transcript if t.role == "user" and str(t.text or "").strip()]
+    if not candidate_turns:
+        raise HTTPException(status_code=400, detail="Transcript contains no candidate answers.")
+
+    prompt = _build_interview_report_prompt(req)
+    try:
+        raw = call_ollama(prompt)
+        data = safe_json_parse(raw)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Interview evaluation failed: {e}")
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="Interview evaluation returned an invalid document.")
+
+    answers = []
+    for a in data.get("answers") or []:
+        if not isinstance(a, dict):
+            continue
+        a["scores"] = _normalize_interview_scores(a.get("scores"))
+        answers.append(a)
+    report = data.get("report") if isinstance(data.get("report"), dict) else {}
+    if not isinstance(report.get("scores"), dict) and answers:
+        report["scores"] = {
+            k: round(sum(a["scores"][k] for a in answers) / len(answers)) for k in INTERVIEW_SCORE_WEIGHTS
+        }
+    report["scores"] = _normalize_interview_scores(report.get("scores"))
+    report["overall_score"] = interview_overall_score(report["scores"])
+
+    return {
+        "questions": data.get("questions") or [],
+        "answers": answers,
+        "report": report,
+        "evaluation_version": INTERVIEW_EVAL_VERSION,
+    }
