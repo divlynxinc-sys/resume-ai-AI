@@ -1,0 +1,29 @@
+[project]
+name = "jobsynk-interview-agent"
+version = "0.1.0"
+description = "JobSynk AI Interviews — live voice interviewer worker (LiveKit Agents)"
+requires-python = ">=3.10, <3.15"
+
+dependencies = [
+    "livekit-agents>=1.6.10,<2",
+    "livekit-plugins-ai-coustics>=0.3,<1",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.uv]
+# yarl 1.24.1 was published with only a cp310 wheel and no sdist, so it can't
+# install on Python 3.11+. Remove once upstream uploads the remaining wheels.
+constraint-dependencies = ["yarl<1.24"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+testpaths = ["tests"]
